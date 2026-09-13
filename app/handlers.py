@@ -15,7 +15,7 @@ from telegram.ext import ContextTypes
 
 from app import storage, texts
 from app.domains import detect_links
-from app.progress import Meter, format_bytes, format_duration, format_speed, render
+from app.progress import Meter, format_bytes, render
 from app.resolver import FileInfo, resolve
 from app.settings import settings
 
@@ -72,23 +72,46 @@ def _can_upload(file: FileInfo) -> bool:
     return not file.size or file.size <= _upload_limit_mb() * 1024 * 1024
 
 
+def resolve_redirect(token: str, kind: str) -> str | None:
+    """Look up the real TeraBox URL behind a public /go/ link. Used by the
+    tiny redirect webpage in app.main so buttons never show the raw
+    TeraBox/CDN host to the user."""
+    item = CACHE.get(token)
+    if not item or item.expires_at <= time.monotonic():
+        return None
+    file = item.file
+    if kind == "stream":
+        return file.stream_hd_url or file.stream_url
+    if kind == "direct":
+        return file.direct_link
+    return None
+
+
+def _public_link(token: str, kind: str) -> str | None:
+    base = settings.public_base_url
+    if not base:
+        return None
+    return f"{base}/go/{token}?t={kind}"
+
+
 def _file_keyboard(file: FileInfo, token: str) -> InlineKeyboardMarkup:
     rows: list[list[InlineKeyboardButton]] = []
-    stream_row: list[InlineKeyboardButton] = []
-    if file.stream_url:
-        stream_row.append(InlineKeyboardButton("▶ stream", url=file.stream_url))
-    if file.stream_hd_url and file.stream_hd_url != file.stream_url:
-        stream_row.append(InlineKeyboardButton("▶ stream hd", url=file.stream_hd_url))
-    if stream_row:
-        rows.append(stream_row)
 
-    action_row: list[InlineKeyboardButton] = []
+    top_row: list[InlineKeyboardButton] = []
+    stream_target = file.stream_hd_url or file.stream_url
+    if stream_target:
+        hidden = _public_link(token, "stream")
+        top_row.append(InlineKeyboardButton("▶ stream", url=hidden or stream_target))
     if file.direct_link:
-        action_row.append(InlineKeyboardButton("↗ direct", url=file.direct_link))
+        hidden = _public_link(token, "direct")
+        top_row.append(InlineKeyboardButton("↗ direct", url=hidden or file.direct_link))
+    if top_row:
+        rows.append(top_row)
+
     if _can_upload(file):
-        action_row.append(InlineKeyboardButton(f"↓ send file · {file.formatted_size}", callback_data=f"dl:{token}"))
-    if action_row:
-        rows.append(action_row)
+        rows.append(
+            [InlineKeyboardButton(f"↓ send file · {file.formatted_size}", callback_data=f"dl:{token}")]
+        )
     return InlineKeyboardMarkup(rows)
 
 
@@ -389,7 +412,6 @@ async def download_and_send(message, file: FileInfo, user_id: int) -> None:
         safe_name = re.sub(r"[^A-Za-z0-9._-]+", "_", file.file_name).strip("._")[:80] or "download"
         dest = settings.download_dir / f"{secrets.token_hex(5)}_{safe_name}"
         settings.download_dir.mkdir(parents=True, exist_ok=True)
-        started = time.monotonic()
         try:
             await _download_file(status, url or "", dest, file)
             size = dest.stat().st_size if dest.exists() else file.size
@@ -408,16 +430,15 @@ async def download_and_send(message, file: FileInfo, user_id: int) -> None:
             await _safe_edit(status, render("upload", _escape(file.file_name), 0, size, 0, 0))
             await _upload_to_telegram(status, message.chat.id, dest, file, size)
             storage.bump_download(user_id)
-            took = time.monotonic() - started
-            await _safe_edit(
-                status,
-                texts.FINISHED.format(
-                    filename=_escape(file.file_name),
-                    size=_escape(format_bytes(size)),
-                    speed=_escape(format_speed(size / max(took, 0.2))),
-                    duration=_escape(format_duration(took)),
-                ),
-            )
+            # The file has now arrived as its own message in the chat, so the
+            # "file ready" message (with the stream/direct/send buttons) and
+            # the progress status message are no longer needed — clean both up
+            # instead of leaving a stale "finished" text behind.
+            for stale in (status, message):
+                try:
+                    await stale.delete()
+                except Exception:
+                    pass
         except Exception as exc:
             storage.log("error", str(exc))
             await _safe_edit(status, texts.FAILED.format(reason=_escape(exc)))
@@ -440,35 +461,111 @@ def _too_large_text(file: FileInfo, limit: int, actual_size: int | None = None) 
     return texts.TOO_LARGE.format(size=_escape(size), limit=limit, hint=hint)
 
 
+_DL_HEADERS = {
+    "user-agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"
+    ),
+    "referer": "https://www.teraboxdl.site/",
+}
+PARALLEL_SEGMENTS = 6
+PARALLEL_MIN_BYTES = 12 * 1024 * 1024  # below this, one connection is plenty
+
+
+async def _probe_range_support(client: httpx.AsyncClient, url: str) -> int:
+    """Returns the file size if the server supports byte-range requests
+    (needed to split the download across several connections), else 0."""
+    try:
+        headers = {**_DL_HEADERS, "range": "bytes=0-0"}
+        async with client.stream("GET", url, headers=headers) as res:
+            if res.status_code != 206:
+                return 0
+            content_range = res.headers.get("content-range", "")
+            total = int(content_range.split("/")[-1]) if "/" in content_range else 0
+            return total
+    except Exception:
+        return 0
+
+
 async def _download_file(status, url: str, dest: Path, file: FileInfo) -> None:
     meter = Meter()
-    last_edit = 0.0
+    last_edit = [0.0]
+    lock = asyncio.Lock()
+    done_ref = [0]
+
+    async def report(total: int) -> None:
+        now = time.monotonic()
+        if now - last_edit[0] < 0.8 and done_ref[0] < total:
+            return
+        last_edit[0] = now
+        speed, elapsed = meter.update(done_ref[0])
+        await _safe_edit(
+            status,
+            render("download", _escape(file.file_name), done_ref[0], total or done_ref[0], speed, elapsed),
+        )
+
     timeout = httpx.Timeout(None, connect=20.0)
-    headers = {
-        "user-agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"
-        ),
-        "referer": "https://www.teraboxdl.site/",
-    }
     async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client:
-        async with client.stream("GET", url, headers=headers) as res:
+        total = await _probe_range_support(client, url)
+        if total >= PARALLEL_MIN_BYTES:
+            try:
+                await _download_parallel(client, url, dest, total, lock, done_ref, report)
+                return
+            except Exception:
+                # Fall through to a plain single-connection download if the
+                # segmented attempt failed partway through (server hiccup,
+                # a segment dropping, etc). Reset progress and retry clean.
+                done_ref[0] = 0
+                meter.reset()
+
+        async with client.stream("GET", url, headers=_DL_HEADERS) as res:
             res.raise_for_status()
             total = int(res.headers.get("content-length") or file.size or 0)
-            done = 0
             with dest.open("wb") as fh:
                 async for chunk in res.aiter_bytes(256 * 1024):
                     fh.write(chunk)
-                    done += len(chunk)
-                    now = time.monotonic()
-                    if now - last_edit < 0.8 and done < total:
-                        continue
-                    last_edit = now
-                    speed, elapsed = meter.update(done)
-                    await _safe_edit(
-                        status,
-                        render("download", _escape(file.file_name), done, total or done, speed, elapsed),
-                    )
+                    done_ref[0] += len(chunk)
+                    await report(total)
+
+
+async def _download_parallel(
+    client: httpx.AsyncClient,
+    url: str,
+    dest: Path,
+    total: int,
+    lock: asyncio.Lock,
+    done_ref: list[int],
+    report: Callable[[int], Awaitable[None]],
+) -> None:
+    """Downloads several byte-ranges of the same file concurrently. This
+    helps when the bottleneck is a per-connection throttle on the source
+    CDN rather than the actual pipe — opening N connections can multiply
+    effective throughput even though each one is still capped."""
+    with dest.open("wb") as fh:
+        fh.truncate(total)
+
+    segment_size = -(-total // PARALLEL_SEGMENTS)
+    ranges = []
+    start = 0
+    while start < total:
+        end = min(start + segment_size, total) - 1
+        ranges.append((start, end))
+        start = end + 1
+
+    async def fetch(rng: tuple[int, int]) -> None:
+        seg_start, seg_end = rng
+        headers = {**_DL_HEADERS, "range": f"bytes={seg_start}-{seg_end}"}
+        async with client.stream("GET", url, headers=headers) as res:
+            res.raise_for_status()
+            with dest.open("r+b") as fh:
+                fh.seek(seg_start)
+                async for chunk in res.aiter_bytes(256 * 1024):
+                    fh.write(chunk)
+                    async with lock:
+                        done_ref[0] += len(chunk)
+                    await report(total)
+
+    await asyncio.gather(*(fetch(r) for r in ranges))
 
 
 class _MultipartUpload(httpx.AsyncByteStream):
@@ -480,15 +577,17 @@ class _MultipartUpload(httpx.AsyncByteStream):
         filename: str,
         content_type: str,
         on_progress: Callable[[int], Awaitable[None]],
+        thumbnail: bytes | None = None,
     ) -> None:
         self.boundary = f"----teradrop-{secrets.token_hex(12)}"
         self.file_path = file_path
         self.on_progress = on_progress
         self.sent = 0
         self.file_size = file_path.stat().st_size
-        self.prefix = b"".join(
-            self._field_part(name, value) for name, value in fields.items()
-        ) + self._file_prefix(file_field, filename, content_type)
+        prefix = b"".join(self._field_part(name, value) for name, value in fields.items())
+        if thumbnail:
+            prefix += self._file_prefix("thumbnail", "thumb.jpg", "image/jpeg") + thumbnail + b"\r\n"
+        self.prefix = prefix + self._file_prefix(file_field, filename, content_type)
         self.suffix = f"\r\n--{self.boundary}--\r\n".encode()
         self.content_length = len(self.prefix) + self.file_size + len(self.suffix)
 
@@ -523,11 +622,26 @@ class _MultipartUpload(httpx.AsyncByteStream):
         return
 
 
+async def _fetch_thumbnail(url: str | None) -> bytes | None:
+    if not url:
+        return None
+    try:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(10.0, connect=8.0)) as client:
+            res = await client.get(url)
+            res.raise_for_status()
+            data = res.content
+            # Telegram thumbnails must be under 200 KB and a jpeg/png.
+            return data[: 200 * 1024] if data else None
+    except Exception:
+        return None
+
+
 async def _upload_to_telegram(status, chat_id: int, path: Path, file: FileInfo, size: int) -> None:
     is_video = file.file_name.lower().endswith((".mp4", ".mov", ".webm"))
     method = "sendVideo" if is_video else "sendDocument"
     field = "video" if is_video else "document"
     content_type = "video/mp4" if is_video else "application/octet-stream"
+    thumbnail = await _fetch_thumbnail(file.thumb)
     meter = Meter()
     last_edit = 0.0
 
@@ -545,7 +659,11 @@ async def _upload_to_telegram(status, chat_id: int, path: Path, file: FileInfo, 
         "caption": _caption(file),
         "parse_mode": "HTML",
     }
-    stream = _MultipartUpload(fields, field, path, file.file_name, content_type, progress)
+    if thumbnail:
+        # Per Telegram Bot API: attach the thumbnail as its own multipart
+        # field, then reference it by name via attach://<field_name>.
+        fields["thumbnail"] = "attach://thumbnail"
+    stream = _MultipartUpload(fields, field, path, file.file_name, content_type, progress, thumbnail=thumbnail)
     headers = {
         "content-type": f"multipart/form-data; boundary={stream.boundary}",
         "content-length": str(stream.content_length),
