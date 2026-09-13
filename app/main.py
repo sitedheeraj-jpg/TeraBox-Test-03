@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import logging
+import socket
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from threading import Thread
+from urllib.parse import urlsplit
 
 from telegram.ext import Application, CallbackQueryHandler, CommandHandler, MessageHandler, filters
 
@@ -51,6 +53,27 @@ def start_health() -> None:
     log.info("health on %s", settings.health_port)
 
 
+def validate_bot_api_url() -> None:
+    """Fail early with a useful message when a private API hostname is unreachable."""
+    raw = (settings.bot_api_url or "").strip()
+    if not raw:
+        return
+    parsed = urlsplit(raw)
+    if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+        raise SystemExit(
+            "BOT_API_URL is invalid. Use an HTTP URL such as "
+            "http://telegram-bot-api:8081 or leave it empty for Telegram's hosted API."
+        )
+    try:
+        socket.getaddrinfo(parsed.hostname, parsed.port or (443 if parsed.scheme == "https" else 80))
+    except socket.gaierror as exc:
+        raise SystemExit(
+            f"BOT_API_URL host '{parsed.hostname}' cannot be resolved from this deployment. "
+            "Leave BOT_API_URL empty for the hosted Telegram API, or use the reachable "
+            "private/public URL of a separately running local Bot API server."
+        ) from exc
+
+
 def build_app() -> Application:
     settings.ensure_dirs()
     storage.init()
@@ -92,6 +115,7 @@ def build_app() -> Application:
 def main() -> None:
     if not settings.bot_token:
         raise SystemExit("Set BOT_TOKEN in .env before starting TeraDrop.")
+    validate_bot_api_url()
     start_health()
     log.info(
         "starting %s; large uploads=%s; effective limit=%s MB",
