@@ -56,6 +56,12 @@ class Meter:
         self.last_n = 0
         self.ema = 0.0
 
+    def reset(self) -> None:
+        self.started = time.monotonic()
+        self.last_t = self.started
+        self.last_n = 0
+        self.ema = 0.0
+
     def update(self, done: int) -> tuple[float, float]:
         now = time.monotonic()
         dt = max(0.001, now - self.last_t)
