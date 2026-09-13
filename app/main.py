@@ -4,11 +4,11 @@ import logging
 import socket
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from threading import Thread
-from urllib.parse import parse_qs, urlsplit
+from urllib.parse import urlsplit
 
 from telegram.ext import Application, CallbackQueryHandler, CommandHandler, MessageHandler, filters
 
-from app import storage
+from app import storage, webproxy
 from app.handlers import (
     auth_cmd,
     ban_cmd,
@@ -19,7 +19,6 @@ from app.handlers import (
     on_callback,
     on_text,
     owner_cmd,
-    resolve_redirect,
     setcaption_cmd,
     setlimit_cmd,
     setwelcome_cmd,
@@ -39,7 +38,10 @@ class HealthHandler(BaseHTTPRequestHandler):
     def do_GET(self) -> None:  # noqa: N802
         parsed = urlsplit(self.path)
         if parsed.path.startswith("/go/"):
-            self._handle_redirect(parsed)
+            webproxy.serve_page(self, parsed)
+            return
+        if parsed.path.startswith("/media/"):
+            webproxy.serve_media(self, parsed)
             return
         body = b'{"ok":true,"service":"teradrop"}'
         self.send_response(200)
@@ -48,24 +50,12 @@ class HealthHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
-    def _handle_redirect(self, parsed) -> None:
-        # Public "/go/<token>?t=stream|direct" links. This is what buttons
-        # shown to users point at instead of the raw TeraBox/CDN URL, so the
-        # real link only appears server-side in a short-lived 302 redirect.
-        token = parsed.path.removeprefix("/go/").strip("/")
-        kind = (parse_qs(parsed.query).get("t") or [""])[0]
-        target = resolve_redirect(token, kind) if token and kind else None
-        if not target:
-            body = b"this link has expired. open the file again in the bot."
-            self.send_response(404)
-            self.send_header("content-type", "text/plain")
-            self.send_header("content-length", str(len(body)))
-            self.end_headers()
-            self.wfile.write(body)
+    def do_HEAD(self) -> None:  # noqa: N802
+        parsed = urlsplit(self.path)
+        if parsed.path.startswith("/media/"):
+            webproxy.serve_media(self, parsed, head_only=True)
             return
-        self.send_response(302)
-        self.send_header("location", target)
-        self.send_header("content-length", "0")
+        self.send_response(200)
         self.end_headers()
 
     def log_message(self, format: str, *args) -> None:  # noqa: A003
