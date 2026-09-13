@@ -312,7 +312,10 @@ async def process_link(message, url: str, meta: dict, owner_id: int) -> None:
         kind=kind,
     )
     if not _can_upload(file):
-        body += "\n\n<i>send file is unavailable for this size on the current telegram transport.</i>"
+        if settings.bot_api_enabled:
+            body += "\n\n<i>send file is above the configured owner limit.</i>"
+        else:
+            body += "\n\n" + texts.LARGE_UPLOAD_UNAVAILABLE
     await _safe_edit(status, body, _file_keyboard(file, token))
 
 
