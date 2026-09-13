@@ -72,19 +72,49 @@ def _can_upload(file: FileInfo) -> bool:
     return not file.size or file.size <= _upload_limit_mb() * 1024 * 1024
 
 
-def resolve_redirect(token: str, kind: str) -> str | None:
-    """Look up the real TeraBox URL behind a public /go/ link. Used by the
-    tiny redirect webpage in app.main so buttons never show the raw
-    TeraBox/CDN host to the user."""
+def resolve_cached_file(token: str) -> FileInfo | None:
+    """Look up the FileInfo behind a public link token, used by the tiny
+    webpage/proxy in app.webproxy so it can render a title and know which
+    upstream URL to fetch without ever handing that URL to the browser."""
     item = CACHE.get(token)
     if not item or item.expires_at <= time.monotonic():
         return None
-    file = item.file
+    return item.file
+
+
+def resolve_redirect(token: str, kind: str) -> str | None:
+    """Real upstream URL behind a token, for server-side use only (the
+    proxy in app.webproxy fetches this itself — it is never sent to the
+    browser)."""
+    file = resolve_cached_file(token)
+    if not file:
+        return None
     if kind == "stream":
         return file.stream_hd_url or file.stream_url
     if kind == "direct":
         return file.direct_link
     return None
+
+
+_PENDING_TASKS: set[asyncio.Task] = set()
+
+
+def _schedule_expiry_cleanup(msg, token: str, delay: float) -> None:
+    """Deletes the 'file ready' message (with its stream/direct/send
+    buttons) once our cached copy of the resolved TeraBox link would be
+    considered stale, so users never see dead buttons."""
+
+    async def _run() -> None:
+        await asyncio.sleep(delay)
+        if CACHE.pop(token, None) is not None:
+            try:
+                await msg.delete()
+            except Exception:
+                pass
+
+    task = asyncio.create_task(_run())
+    _PENDING_TASKS.add(task)
+    task.add_done_callback(_PENDING_TASKS.discard)
 
 
 def _public_link(token: str, kind: str) -> str | None:
@@ -340,6 +370,7 @@ async def process_link(message, url: str, meta: dict, owner_id: int) -> None:
         else:
             body += "\n\n" + texts.LARGE_UPLOAD_UNAVAILABLE
     await _safe_edit(status, body, _file_keyboard(file, token))
+    _schedule_expiry_cleanup(status, token, CACHE_TTL_SECONDS)
 
 
 async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -368,15 +399,17 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
                 parse_mode=ParseMode.HTML,
             )
             return
-        await query.message.reply_text(
+        new_token = _cache(file, user.id)
+        sent = await query.message.reply_text(
             texts.READY.format(
                 filename=_escape(file.file_name),
                 size=_escape(file.formatted_size),
                 kind="ғɪʟᴇ",
             ),
             parse_mode=ParseMode.HTML,
-            reply_markup=_file_keyboard(file, _cache(file, user.id)),
+            reply_markup=_file_keyboard(file, new_token),
         )
+        _schedule_expiry_cleanup(sent, new_token, CACHE_TTL_SECONDS)
         return
     if data.startswith("dl:"):
         file = _cached(data.split(":", 1)[1], user.id)
