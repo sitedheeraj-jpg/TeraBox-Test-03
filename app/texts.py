@@ -50,6 +50,13 @@ TOO_LARGE = (
     "the current bot upload limit is {limit} mb.</blockquote>\n\n"
     "{hint}"
 )
+LARGE_UPLOAD_UNAVAILABLE = (
+    "<b>ʟᴀʀɢᴇ ғɪʟᴇ sᴇɴᴅ ɪs ɴᴏᴛ ᴇɴᴀʙʟᴇᴅ</b>\n"
+    "<blockquote>this deployment is using telegram’s hosted bot api, "
+    "which limits bot uploads to 49 mb.</blockquote>\n\n"
+    "stream and direct are still available. to send files above 49 mb, "
+    "connect a reachable local bot api server with <code>BOT_API_URL</code>."
+)
 NO_LINK = "<b>ɴᴏ sʜᴀʀᴇ ʟɪɴᴋ ғᴏᴜɴᴅ</b>\n\nsend a public terabox link and i’ll take it from there."
 PRIVATE = "<b>ᴘʀɪᴠᴀᴛᴇ ʙᴏᴛ</b>\nask the owner to authorise your account."
 BANNED = "<b>ᴀᴄᴄᴇss ʀᴇᴠᴏᴋᴇᴅ</b>\nthis account can’t use the bot."
