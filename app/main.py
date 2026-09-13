@@ -123,6 +123,12 @@ def main() -> None:
         settings.bot_api_enabled,
         settings.effective_max_file_mb,
     )
+    if settings.max_file_mb > settings.effective_max_file_mb and not settings.bot_api_enabled:
+        log.warning(
+            "MAX_FILE_MB=%s cannot be used with Telegram's hosted Bot API; "
+            "set BOT_API_URL to a reachable local Bot API server for uploads above 49 MB",
+            settings.max_file_mb,
+        )
     application = build_app()
     application.run_polling(allowed_updates=["message", "callback_query"])
 
