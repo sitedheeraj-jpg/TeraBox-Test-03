@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 from pydantic import Field
@@ -45,6 +46,21 @@ class Settings(BaseSettings):
     download_dir: Path = Field(default=Path("/app/data/tmp"), alias="DOWNLOAD_DIR")
     data_dir: Path = Field(default=Path("/app/data"), alias="DATA_DIR")
     health_port: int = Field(default=8080, alias="HEALTH_PORT")
+    # Optional explicit override. If unset, we fall back to Railway's own
+    # RAILWAY_PUBLIC_DOMAIN (auto-injected once a public domain is generated
+    # for this service), so no manual configuration is usually needed.
+    public_base_url_override: str = Field(default="", alias="PUBLIC_BASE_URL")
+
+    @property
+    def public_base_url(self) -> str:
+        """Public https base URL for this service's own webpage, used to hide
+        the real TeraBox stream/direct links behind our own domain. Empty
+        means link-hiding is disabled and raw links are used as before."""
+        explicit = (self.public_base_url_override or "").strip().rstrip("/")
+        if explicit:
+            return explicit
+        domain = (os.environ.get("RAILWAY_PUBLIC_DOMAIN") or "").strip().rstrip("/")
+        return f"https://{domain}" if domain else ""
 
     @property
     def owner_ids(self) -> set[int]:
