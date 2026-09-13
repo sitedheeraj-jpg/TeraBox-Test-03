@@ -43,6 +43,11 @@ progress.
 The local Bot API service is private to the Docker network. The bot itself is
 available on port `8080` for health checks.
 
+When deploying only the bot container on Railway, Render, or another
+standalone host, leave `BOT_API_URL` empty unless you have deployed a separate
+local Bot API server and supplied its reachable URL. The Docker-only hostname
+`telegram-bot-api` will not resolve from a standalone service.
+
 ## Important upload limitation
 
 The local Bot API server is required for files above the hosted Bot API limit.
