@@ -4,6 +4,7 @@ import asyncio
 import html
 import re
 import secrets
+import shutil
 import time
 from pathlib import Path
 from typing import Awaitable, Callable
@@ -447,6 +448,9 @@ async def download_and_send(message, file: FileInfo, user_id: int) -> None:
         settings.download_dir.mkdir(parents=True, exist_ok=True)
         try:
             await _download_file(status, url or "", dest, file)
+            if file.file_name.lower().endswith((".mp4", ".mov", ".m4v")):
+                await _safe_edit(status, f"optimizing <b>{_escape(file.file_name)}</b> for streaming…")
+                await _remux_faststart(status, dest, file)
             size = dest.stat().st_size if dest.exists() else file.size
             if size > limit_bytes:
                 await _safe_edit(
@@ -501,6 +505,7 @@ _DL_HEADERS = {
     ),
     "referer": "https://www.teraboxdl.site/",
 }
+PROGRESS_EDIT_INTERVAL = 7.0  # seconds between message edits, well under Telegram's rate limits
 PARALLEL_SEGMENTS = 6
 PARALLEL_MIN_BYTES = 12 * 1024 * 1024  # below this, one connection is plenty
 
@@ -528,7 +533,7 @@ async def _download_file(status, url: str, dest: Path, file: FileInfo) -> None:
 
     async def report(total: int) -> None:
         now = time.monotonic()
-        if now - last_edit[0] < 0.8 and done_ref[0] < total:
+        if now - last_edit[0] < PROGRESS_EDIT_INTERVAL and done_ref[0] < total:
             return
         last_edit[0] = now
         speed, elapsed = meter.update(done_ref[0])
@@ -669,8 +674,42 @@ async def _fetch_thumbnail(url: str | None) -> bytes | None:
         return None
 
 
+async def _remux_faststart(status, dest: Path, file: FileInfo) -> None:
+    """Moves the MP4 'moov atom' to the front of the file so Telegram (and
+    the in-app player) can start playback before the whole file has
+    downloaded. This is a fast container-only remux (-c copy, no
+    re-encoding) — a few seconds even for large files. If ffmpeg is missing
+    or the remux fails for any reason, we silently keep the original file
+    so the send still goes through, just without the streaming benefit."""
+    ffmpeg = shutil.which("ffmpeg")
+    if not ffmpeg:
+        return
+    tmp_out = dest.with_suffix(dest.suffix + ".faststart.mp4")
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            ffmpeg,
+            "-y",
+            "-i",
+            str(dest),
+            "-c",
+            "copy",
+            "-movflags",
+            "+faststart",
+            str(tmp_out),
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.DEVNULL,
+        )
+        await asyncio.wait_for(proc.wait(), timeout=180)
+        if proc.returncode == 0 and tmp_out.exists() and tmp_out.stat().st_size > 0:
+            tmp_out.replace(dest)
+        else:
+            tmp_out.unlink(missing_ok=True)
+    except Exception:
+        tmp_out.unlink(missing_ok=True)
+
+
 async def _upload_to_telegram(status, chat_id: int, path: Path, file: FileInfo, size: int) -> None:
-    is_video = file.file_name.lower().endswith((".mp4", ".mov", ".webm"))
+    is_video = file.file_name.lower().endswith((".mp4", ".mov", ".webm", ".m4v"))
     method = "sendVideo" if is_video else "sendDocument"
     field = "video" if is_video else "document"
     content_type = "video/mp4" if is_video else "application/octet-stream"
@@ -681,7 +720,7 @@ async def _upload_to_telegram(status, chat_id: int, path: Path, file: FileInfo, 
     async def progress(done: int) -> None:
         nonlocal last_edit
         now = time.monotonic()
-        if now - last_edit < 0.8 and done < size:
+        if now - last_edit < PROGRESS_EDIT_INTERVAL and done < size:
             return
         last_edit = now
         speed, elapsed = meter.update(done)
@@ -692,6 +731,10 @@ async def _upload_to_telegram(status, chat_id: int, path: Path, file: FileInfo, 
         "caption": _caption(file),
         "parse_mode": "HTML",
     }
+    if is_video:
+        # Lets Telegram clients start playing while the file is still
+        # arriving, instead of forcing a full download first.
+        fields["supports_streaming"] = "true"
     if thumbnail:
         # Per Telegram Bot API: attach the thumbnail as its own multipart
         # field, then reference it by name via attach://<field_name>.
