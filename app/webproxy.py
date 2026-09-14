@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import html
+import select
 import shutil
 import subprocess
+import threading
 from http.server import BaseHTTPRequestHandler
 from urllib.parse import parse_qs
 
@@ -98,24 +100,47 @@ def serve_page(handler: BaseHTTPRequestHandler, parsed) -> None:
     handler.wfile.write(page)
 
 
+def _drain_stderr(proc: subprocess.Popen, sink: bytearray) -> None:
+    try:
+        while True:
+            chunk = proc.stderr.read(4096)
+            if not chunk:
+                return
+            sink.extend(chunk)
+            del sink[:-4000]  # keep only the tail, ffmpeg's real error is usually last
+    except Exception:
+        return
+
+
+def _redact(text: str, secret_url: str) -> str:
+    if secret_url and secret_url in text:
+        text = text.replace(secret_url, "[hidden]")
+    return text
+
+
 def _transmux_stream(handler: BaseHTTPRequestHandler, source_url: str, head_only: bool) -> None:
     """Runs the source (HLS manifest or direct video, doesn't matter which)
     through ffmpeg and pipes out plain fragmented MP4. This is what actually
     fixes playback: browsers don't have to parse HLS at all, and it works
     the same way regardless of what format TeraBox happens to hand back.
     Container-only (-c copy): ffmpeg re-muxes, it does not re-encode, so
-    this is cheap on CPU."""
+    this is cheap on CPU.
+
+    Crucially, we don't send any HTTP response headers until we've actually
+    confirmed ffmpeg produced real output — otherwise a silent ffmpeg
+    failure looks like a successful-but-empty video to the browser, which
+    is indistinguishable from the broken player you'd otherwise see."""
     ffmpeg = shutil.which("ffmpeg")
-    handler.send_response(200)
-    handler.send_header("content-type", "video/mp4")
-    handler.send_header("cache-control", "no-store")
-    handler.end_headers()
-    if head_only:
-        return
     if not ffmpeg:
-        # Extremely unlikely (image installs ffmpeg), but don't hang the
-        # request if it's ever missing.
+        handler.send_response(503)
+        body = b"Streaming is unavailable on this deployment (ffmpeg not installed)."
+        handler.send_header("content-type", "text/plain")
+        handler.send_header("content-length", str(len(body)))
+        handler.end_headers()
+        if not head_only:
+            handler.wfile.write(body)
         return
+
     cmd = [
         ffmpeg,
         "-loglevel", "error",
@@ -130,16 +155,55 @@ def _transmux_stream(handler: BaseHTTPRequestHandler, source_url: str, head_only
         "-movflags", "frag_keyframe+empty_moov+default_base_moof",
         "pipe:1",
     ]
-    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    stderr_tail = bytearray()
+    threading.Thread(target=_drain_stderr, args=(proc, stderr_tail), daemon=True).start()
+
+    # Wait for the first chunk of real MP4 output before committing to a
+    # 200 response, with a generous timeout for the initial connect+probe.
+    first_chunk = b""
     try:
+        readable, _, _ = select.select([proc.stdout], [], [], 20.0)
+        if readable:
+            first_chunk = proc.stdout.read(256 * 1024) or b""
+    except Exception:
+        first_chunk = b""
+
+    if not first_chunk:
+        proc.kill()
+        try:
+            proc.wait(timeout=5)
+        except Exception:
+            pass
+        err = _redact(bytes(stderr_tail).decode("utf-8", "replace").strip(), source_url)
+        body = (
+            "Could not start the stream.\n"
+            + (err[-500:] if err else "The source did not return any playable data.")
+        ).encode()
+        handler.send_response(502)
+        handler.send_header("content-type", "text/plain; charset=utf-8")
+        handler.send_header("content-length", str(len(body)))
+        handler.end_headers()
+        if not head_only:
+            handler.wfile.write(body)
+        return
+
+    handler.send_response(200)
+    handler.send_header("content-type", "video/mp4")
+    handler.send_header("cache-control", "no-store")
+    handler.end_headers()
+    if head_only:
+        proc.kill()
+        return
+    try:
+        handler.wfile.write(first_chunk)
         while True:
             chunk = proc.stdout.read(256 * 1024)
             if not chunk:
                 break
-            try:
-                handler.wfile.write(chunk)
-            except (BrokenPipeError, ConnectionResetError):
-                break
+            handler.wfile.write(chunk)
+    except (BrokenPipeError, ConnectionResetError):
+        pass
     finally:
         try:
             proc.stdout.close()
