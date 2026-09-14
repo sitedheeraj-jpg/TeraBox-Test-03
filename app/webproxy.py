@@ -41,28 +41,72 @@ _PAGE = """<!doctype html>
 </html>"""
 
 _HLS_BODY = """<video id="v" controls playsinline></video>
-<div class="hint" id="hint"></div>
+<div class="hint" id="hint">loading…</div>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/hls.js/1.5.15/hls.min.js"></script>
 <script>
+(function () {{
   var video = document.getElementById('v');
-  var src = {src!r};
+  var mediaUrl = {src!r};
   var hint = document.getElementById('hint');
-  function fail(msg) {{ hint.textContent = msg; }}
-  if (video.canPlayType('application/vnd.apple.mpegurl')) {{
-    // Safari/iOS play HLS natively
-    video.src = src;
-    video.play().catch(function(){{}});
-  }} else if (window.Hls && Hls.isSupported()) {{
-    var hls = new Hls();
-    hls.on(Hls.Events.ERROR, function(_e, data) {{
-      if (data.fatal) fail('Playback error (' + data.type + '). Try Direct instead.');
-    }});
-    hls.loadSource(src);
-    hls.attachMedia(video);
-    video.play().catch(function(){{}});
-  }} else {{
-    fail('This browser cannot play this stream. Try Direct instead.');
+  var triedPlain = false;
+
+  function say(msg) {{ hint.textContent = msg; }}
+
+  function playPlain() {{
+    if (triedPlain) return;
+    triedPlain = true;
+    video.src = mediaUrl;
+    video.play().catch(function () {{}});
+    say('');
   }}
+
+  function playHls() {{
+    if (video.canPlayType('application/vnd.apple.mpegurl')) {{
+      // Safari/iOS can play HLS natively.
+      video.src = mediaUrl;
+      video.play().catch(function () {{}});
+      say('');
+      return;
+    }}
+    if (!(window.Hls && Hls.isSupported())) {{
+      playPlain();
+      return;
+    }}
+    var hls = new Hls();
+    hls.on(Hls.Events.ERROR, function (_e, data) {{
+      if (!data.fatal) return;
+      // If HLS parsing/playback fails outright, this might not actually be
+      // a manifest (some sources mislabel a plain video as one) — fall
+      // back to treating it as a direct file instead of just failing.
+      hls.destroy();
+      playPlain();
+    }});
+    hls.loadSource(mediaUrl);
+    hls.attachMedia(video);
+    video.play().catch(function () {{}});
+    say('');
+  }}
+
+  fetch(mediaUrl, {{ method: 'HEAD' }})
+    .then(function (res) {{
+      var ct = (res.headers.get('content-type') || '').toLowerCase();
+      if (ct.indexOf('mpegurl') !== -1 || ct.indexOf('m3u8') !== -1) {{
+        playHls();
+      }} else {{
+        playPlain();
+      }}
+    }})
+    .catch(function () {{
+      // If the HEAD probe itself fails, still try something rather than
+      // sitting on a blank player.
+      playHls();
+    }});
+
+  video.addEventListener('error', function () {{
+    if (!triedPlain) playPlain();
+    else say('Playback failed. Try the Direct button instead.');
+  }});
+}})();
 </script>"""
 
 
@@ -97,19 +141,12 @@ def serve_page(handler: BaseHTTPRequestHandler, parsed) -> None:
     title = html.escape(file.file_name)
     media_url = f"/media/{token}?t={kind}"
     if kind == "stream":
-        target = resolve_redirect(token, kind) or ""
-        content_type = ""
-        try:
-            with httpx.stream(
-                "GET", target, headers=_UPSTREAM_HEADERS, follow_redirects=True, timeout=_TIMEOUT
-            ) as probe:
-                content_type = probe.headers.get("content-type", "")
-        except httpx.HTTPError:
-            pass
-        if _looks_like_hls(target, content_type):
-            body = _HLS_BODY.format(src=media_url)
-        else:
-            body = f'<video controls autoplay playsinline src="{media_url}"></video>'
+        # The player itself figures out (via a HEAD request to our own
+        # /media/ endpoint) whether this is an HLS manifest or a direct
+        # playable file, and falls back automatically if one approach
+        # fails — no need to guess here or make an extra request to the
+        # real upstream just to decide.
+        body = _HLS_BODY.format(src=media_url)
     else:
         body = (
             f'<a class="button" href="{media_url}" download="{title}">⬇ Download {html.escape(file.formatted_size)}</a>'
