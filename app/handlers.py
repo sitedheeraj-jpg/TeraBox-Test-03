@@ -322,15 +322,32 @@ async def process_link(message, url: str, meta: dict, owner_id: int) -> None:
         ),
     )
     await _safe_edit(status, texts.RETRIEVING)
-    try:
-        result = await resolve(url)
-    except Exception as exc:
-        storage.log("error", str(exc))
-        await _safe_edit(status, texts.FAILED.format(reason=_escape(exc)))
+    result = None
+    last_exc: Exception | None = None
+    attempts = 3
+    for attempt in range(1, attempts + 1):
+        try:
+            result = await resolve(url)
+            last_exc = None
+            if result.ok:
+                break
+            # A failed resolve is often just a transient hiccup upstream
+            # (challenge page, brief rate limit) — retry a couple of times
+            # before giving up, instead of failing on the first try.
+        except Exception as exc:
+            last_exc = exc
+            result = None
+        if attempt < attempts:
+            await _safe_edit(status, f"{texts.RETRIEVING} (retry {attempt}/{attempts - 1})")
+            await asyncio.sleep(2.5)
+    if last_exc is not None:
+        storage.log("error", str(last_exc))
+        await _safe_edit(status, texts.FAILED.format(reason=_escape(last_exc)))
         return
-    if not result.ok:
-        storage.log("warn", result.message)
-        await _safe_edit(status, texts.FAILED.format(reason=_escape(result.message)))
+    if result is None or not result.ok:
+        reason = result.message if result else "unknown error"
+        storage.log("warn", reason)
+        await _safe_edit(status, texts.FAILED.format(reason=_escape(reason)))
         return
     await _safe_edit(status, texts.RESOLVING)
     file = result.files[0]
