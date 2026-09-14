@@ -26,7 +26,6 @@ _PAGE = """<!doctype html>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>{title}</title>
-<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/fluid-player@3/dist/fluidplayer.min.css">
 <style>
   body {{ background:#0b0d12; color:#eaeaea; font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif;
          display:flex; flex-direction:column; align-items:center; padding:32px 16px; }}
@@ -35,6 +34,7 @@ _PAGE = """<!doctype html>
   a.button {{ margin-top:24px; display:inline-block; padding:14px 28px; border-radius:10px;
               background:#5b8cff; color:#fff; text-decoration:none; font-weight:600; font-size:15px; }}
   .hint {{ color:#8a8f98; font-size:13px; margin-top:14px; }}
+  .err {{ color:#ff6b6b; font-size:13px; margin-top:14px; display:none; }}
 </style>
 </head>
 <body>
@@ -43,21 +43,17 @@ _PAGE = """<!doctype html>
 </body>
 </html>"""
 
-_STREAM_BODY = """<video id="player" controls playsinline preload="auto">
+# Plain native <video>. No third-party player skin: the stream is a
+# fragmented MP4 with an empty moov (no known duration/seek table, by
+# design, so playback can start before the whole file is fetched). A
+# custom player that tries to draw a duration/seek bar will show NaN and
+# look "corrupted" — the native element just plays it as a live stream.
+_STREAM_BODY = """<video id="player" controls playsinline autoplay preload="auto"
+       onerror="document.getElementById('err').style.display='block'">
   <source src="{src}" type="video/mp4">
 </video>
 <div class="hint">Playback starts as soon as the first part arrives — no need to wait for a full download.</div>
-<script src="https://cdn.jsdelivr.net/npm/fluid-player@3/dist/fluidplayer.min.js"></script>
-<script>
-  fluidPlayer('player', {{
-    layoutControls: {{
-      fillToContainer: true,
-      autoPlay: true,
-      posterImage: false,
-      controlBar: {{ autoHide: true }}
-    }}
-  }});
-</script>"""
+<div class="err" id="err">Playback failed. Try the Direct Download link from the bot instead.</div>"""
 
 
 def _not_found(handler: BaseHTTPRequestHandler) -> None:
@@ -191,6 +187,13 @@ def _transmux_stream(handler: BaseHTTPRequestHandler, source_url: str, head_only
     handler.send_response(200)
     handler.send_header("content-type", "video/mp4")
     handler.send_header("cache-control", "no-store")
+    # Tell WebKit (Safari / Telegram's in-app browser, which is WKWebView
+    # on iOS) explicitly not to issue Range requests. Without this header,
+    # WebKit sends one anyway, gets back a non-206 response for it (we
+    # can't honor byte ranges on a live transmux), and renders the video
+    # element as broken/"corrupted" instead of falling back to a plain
+    # sequential stream. This single header is the actual fix for that.
+    handler.send_header("accept-ranges", "none")
     handler.end_headers()
     if head_only:
         proc.kill()
