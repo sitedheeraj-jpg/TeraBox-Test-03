@@ -1,21 +1,21 @@
 from __future__ import annotations
 
 import html
-import re
+import shutil
+import subprocess
 from http.server import BaseHTTPRequestHandler
-from urllib.parse import parse_qs, quote, unquote, urljoin, urlsplit
+from urllib.parse import parse_qs
 
 import httpx
 
 from app.handlers import resolve_cached_file, resolve_redirect
 
-_UPSTREAM_HEADERS = {
-    "user-agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"
-    ),
-    "referer": "https://www.teraboxdl.site/",
-}
+_UA = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"
+)
+_REFERER = "https://www.teraboxdl.site/"
+_UPSTREAM_HEADERS = {"user-agent": _UA, "referer": _REFERER}
 _TIMEOUT = httpx.Timeout(None, connect=20.0)
 
 _PAGE = """<!doctype html>
@@ -24,6 +24,7 @@ _PAGE = """<!doctype html>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>{title}</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/fluid-player@3/dist/fluidplayer.min.css">
 <style>
   body {{ background:#0b0d12; color:#eaeaea; font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif;
          display:flex; flex-direction:column; align-items:center; padding:32px 16px; }}
@@ -40,73 +41,20 @@ _PAGE = """<!doctype html>
 </body>
 </html>"""
 
-_HLS_BODY = """<video id="v" controls playsinline></video>
-<div class="hint" id="hint">loading…</div>
-<script src="https://cdnjs.cloudflare.com/ajax/libs/hls.js/1.5.15/hls.min.js"></script>
+_STREAM_BODY = """<video id="player" controls playsinline preload="auto">
+  <source src="{src}" type="video/mp4">
+</video>
+<div class="hint">Playback starts as soon as the first part arrives — no need to wait for a full download.</div>
+<script src="https://cdn.jsdelivr.net/npm/fluid-player@3/dist/fluidplayer.min.js"></script>
 <script>
-(function () {{
-  var video = document.getElementById('v');
-  var mediaUrl = {src!r};
-  var hint = document.getElementById('hint');
-  var triedPlain = false;
-
-  function say(msg) {{ hint.textContent = msg; }}
-
-  function playPlain() {{
-    if (triedPlain) return;
-    triedPlain = true;
-    video.src = mediaUrl;
-    video.play().catch(function () {{}});
-    say('');
-  }}
-
-  function playHls() {{
-    if (video.canPlayType('application/vnd.apple.mpegurl')) {{
-      // Safari/iOS can play HLS natively.
-      video.src = mediaUrl;
-      video.play().catch(function () {{}});
-      say('');
-      return;
+  fluidPlayer('player', {{
+    layoutControls: {{
+      fillToContainer: true,
+      autoPlay: true,
+      posterImage: false,
+      controlBar: {{ autoHide: true }}
     }}
-    if (!(window.Hls && Hls.isSupported())) {{
-      playPlain();
-      return;
-    }}
-    var hls = new Hls();
-    hls.on(Hls.Events.ERROR, function (_e, data) {{
-      if (!data.fatal) return;
-      // If HLS parsing/playback fails outright, this might not actually be
-      // a manifest (some sources mislabel a plain video as one) — fall
-      // back to treating it as a direct file instead of just failing.
-      hls.destroy();
-      playPlain();
-    }});
-    hls.loadSource(mediaUrl);
-    hls.attachMedia(video);
-    video.play().catch(function () {{}});
-    say('');
-  }}
-
-  fetch(mediaUrl, {{ method: 'HEAD' }})
-    .then(function (res) {{
-      var ct = (res.headers.get('content-type') || '').toLowerCase();
-      if (ct.indexOf('mpegurl') !== -1 || ct.indexOf('m3u8') !== -1) {{
-        playHls();
-      }} else {{
-        playPlain();
-      }}
-    }})
-    .catch(function () {{
-      // If the HEAD probe itself fails, still try something rather than
-      // sitting on a blank player.
-      playHls();
-    }});
-
-  video.addEventListener('error', function () {{
-    if (!triedPlain) playPlain();
-    else say('Playback failed. Try the Direct button instead.');
   }});
-}})();
 </script>"""
 
 
@@ -117,15 +65,6 @@ def _not_found(handler: BaseHTTPRequestHandler) -> None:
     handler.send_header("content-length", str(len(body)))
     handler.end_headers()
     handler.wfile.write(body)
-
-
-def _looks_like_hls(url: str, content_type: str) -> bool:
-    content_type = content_type.lower()
-    return (
-        "mpegurl" in content_type
-        or "m3u8" in content_type
-        or urlsplit(url).path.lower().endswith(".m3u8")
-    )
 
 
 def serve_page(handler: BaseHTTPRequestHandler, parsed) -> None:
@@ -141,12 +80,11 @@ def serve_page(handler: BaseHTTPRequestHandler, parsed) -> None:
     title = html.escape(file.file_name)
     media_url = f"/media/{token}?t={kind}"
     if kind == "stream":
-        # The player itself figures out (via a HEAD request to our own
-        # /media/ endpoint) whether this is an HLS manifest or a direct
-        # playable file, and falls back automatically if one approach
-        # fails — no need to guess here or make an extra request to the
-        # real upstream just to decide.
-        body = _HLS_BODY.format(src=media_url)
+        # Whatever the source actually is (HLS manifest or a direct file),
+        # our own /media/ endpoint always hands back plain, standard MP4 —
+        # see serve_media below — so the page never needs to guess a format
+        # or parse a manifest itself.
+        body = _STREAM_BODY.format(src=media_url)
     else:
         body = (
             f'<a class="button" href="{media_url}" download="{title}">⬇ Download {html.escape(file.formatted_size)}</a>'
@@ -160,85 +98,71 @@ def serve_page(handler: BaseHTTPRequestHandler, parsed) -> None:
     handler.wfile.write(page)
 
 
-def _rewrite_manifest(text: str, base_url: str, token: str, kind: str) -> str:
-    """Rewrites every URI in an HLS manifest (segments, sub-playlists, key
-    files) into our own /media/ proxy so the browser never learns the real
-    CDN host, even mid-playback."""
-    out_lines: list[str] = []
-    for line in text.splitlines():
-        stripped = line.strip()
-        if not stripped:
-            out_lines.append(line)
-            continue
-        if stripped.startswith("#"):
-            m = re.search(r'URI="([^"]+)"', line)
-            if m:
-                abs_url = urljoin(base_url, m.group(1))
-                proxied = f"/media/{token}?t={kind}&seg=" + quote(abs_url, safe="")
-                line = line.replace(m.group(1), proxied)
-            out_lines.append(line)
-            continue
-        abs_url = urljoin(base_url, stripped)
-        out_lines.append(f"/media/{token}?t={kind}&seg=" + quote(abs_url, safe=""))
-    return "\n".join(out_lines) + "\n"
-
-
-def _segment_allowed(seg_url: str, token: str, kind: str) -> bool:
-    # The token itself is the real access control (secret + expiring). This
-    # extra host check just keeps the proxy from being usable to fetch
-    # arbitrary unrelated sites even if a token leaks.
-    resolved = resolve_redirect(token, kind) or ""
-    allowed_host = urlsplit(resolved).hostname or ""
-    seg_host = urlsplit(seg_url).hostname or ""
-    if not allowed_host or not seg_host:
-        return False
-    return seg_host == allowed_host or seg_host.endswith("." + allowed_host.split(".", 1)[-1])
-
-
-def serve_media(handler: BaseHTTPRequestHandler, parsed, head_only: bool = False) -> None:
-    """Proxies the actual file bytes for /media/<token>?t=stream|direct. The
-    upstream URL is fetched here, server-side, and is never sent to the
-    browser in any header or redirect. HLS manifests are additionally
-    rewritten so segment/sub-playlist URLs are also proxied."""
-    token = parsed.path.removeprefix("/media/").strip("/")
-    qs = parse_qs(parsed.query)
-    kind = (qs.get("t") or [""])[0]
-    seg = (qs.get("seg") or [None])[0]
-
-    if seg:
-        target = unquote(seg)
-        if not _segment_allowed(target, token, kind):
-            handler.send_response(403)
-            handler.end_headers()
-            return
-    else:
-        target = resolve_redirect(token, kind) if token else None
-    if not target:
-        _not_found(handler)
+def _transmux_stream(handler: BaseHTTPRequestHandler, source_url: str, head_only: bool) -> None:
+    """Runs the source (HLS manifest or direct video, doesn't matter which)
+    through ffmpeg and pipes out plain fragmented MP4. This is what actually
+    fixes playback: browsers don't have to parse HLS at all, and it works
+    the same way regardless of what format TeraBox happens to hand back.
+    Container-only (-c copy): ffmpeg re-muxes, it does not re-encode, so
+    this is cheap on CPU."""
+    ffmpeg = shutil.which("ffmpeg")
+    handler.send_response(200)
+    handler.send_header("content-type", "video/mp4")
+    handler.send_header("cache-control", "no-store")
+    handler.end_headers()
+    if head_only:
         return
+    if not ffmpeg:
+        # Extremely unlikely (image installs ffmpeg), but don't hang the
+        # request if it's ever missing.
+        return
+    cmd = [
+        ffmpeg,
+        "-loglevel", "error",
+        "-user_agent", _UA,
+        "-headers", f"Referer: {_REFERER}\r\n",
+        "-reconnect", "1",
+        "-reconnect_streamed", "1",
+        "-reconnect_delay_max", "5",
+        "-i", source_url,
+        "-c", "copy",
+        "-f", "mp4",
+        "-movflags", "frag_keyframe+empty_moov+default_base_moof",
+        "pipe:1",
+    ]
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+    try:
+        while True:
+            chunk = proc.stdout.read(256 * 1024)
+            if not chunk:
+                break
+            try:
+                handler.wfile.write(chunk)
+            except (BrokenPipeError, ConnectionResetError):
+                break
+    finally:
+        try:
+            proc.stdout.close()
+        except Exception:
+            pass
+        proc.terminate()
+        try:
+            proc.wait(timeout=5)
+        except Exception:
+            proc.kill()
 
+
+def _proxy_raw(handler: BaseHTTPRequestHandler, target: str, head_only: bool) -> None:
+    """Plain byte passthrough for the Direct-download button — the actual
+    original file, untouched, with Range support so downloads can resume."""
     req_headers = dict(_UPSTREAM_HEADERS)
     range_header = handler.headers.get("Range")
     if range_header:
         req_headers["range"] = range_header
-
     try:
         with httpx.stream(
             "GET", target, headers=req_headers, follow_redirects=True, timeout=_TIMEOUT
         ) as res:
-            content_type = res.headers.get("content-type", "")
-            if _looks_like_hls(target, content_type):
-                res.read()
-                rewritten = _rewrite_manifest(res.text, str(res.url), token, kind)
-                body = rewritten.encode()
-                handler.send_response(200)
-                handler.send_header("content-type", "application/vnd.apple.mpegurl")
-                handler.send_header("content-length", str(len(body)))
-                handler.end_headers()
-                if not head_only:
-                    handler.wfile.write(body)
-                return
-
             handler.send_response(res.status_code if res.status_code in (200, 206) else 502)
             for name in ("content-type", "content-length", "content-range"):
                 if name in res.headers:
@@ -258,3 +182,19 @@ def serve_media(handler: BaseHTTPRequestHandler, parsed, head_only: bool = False
             handler.end_headers()
         except Exception:
             pass
+
+
+def serve_media(handler: BaseHTTPRequestHandler, parsed, head_only: bool = False) -> None:
+    """Serves /media/<token>?t=stream|direct. The upstream URL is only ever
+    used server-side and is never sent to the browser in any header,
+    redirect, or manifest."""
+    token = parsed.path.removeprefix("/media/").strip("/")
+    kind = (parse_qs(parsed.query).get("t") or [""])[0]
+    target = resolve_redirect(token, kind) if token else None
+    if not target:
+        _not_found(handler)
+        return
+    if kind == "stream":
+        _transmux_stream(handler, target, head_only)
+    else:
+        _proxy_raw(handler, target, head_only)
